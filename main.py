@@ -80,7 +80,6 @@ def build_auth_url(shop: str) -> str:
     return f"https://{shop}/admin/oauth/authorize?{urlencode(params)}"
 
 def verify_hmac(params: Dict[str, str]) -> bool:
-    # params must NOT include "signature"; Shopify signs the sorted query excluding 'hmac' and 'signature'
     p = dict(params)
     h = p.pop("hmac", None)
     if not h:
@@ -222,10 +221,9 @@ def dashboard(shop: str = Query(...)):
     return html
 
 # -----------------------------
-# Sales API (minimal)
+# Sales API (REST with correct cursor pagination)
 # -----------------------------
 def _parse_dt(s: str) -> datetime:
-    # Shopify returns ISO8601; we normalize to UTC
     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     return dt.astimezone(timezone.utc)
 
@@ -274,7 +272,9 @@ def api_sales(
         return JSONResponse({"error":"no_token_for_shop"}, status_code=401)
 
     start_dt, end_dt = _daterange_from_params(start, end, days)
-    params = {
+
+    # First request CAN include filters (status/date fields/fields)
+    base_params = {
         "status": status,
         "limit": str(limit),
         "created_at_min": _iso(start_dt),
@@ -287,36 +287,37 @@ def api_sales(
     all_orders: List[Dict[str, Any]] = []
 
     try:
-        next_url = url
-        next_params = params.copy()
-        for _ in range(20):
-            r = client.get(next_url, headers=_shopify_headers(token), params=next_params)
-            r.raise_for_status()
-            data = r.json().get("orders", [])
-            all_orders.extend(data)
+        # ---- FIRST PAGE (with filters) ----
+        r = client.get(url, headers=_shopify_headers(token), params=base_params)
+        r.raise_for_status()
+        payload = r.json()
+        all_orders.extend(payload.get("orders", []))
 
-            link = r.headers.get("Link", "")
-            if 'rel="next"' in link and "page_info=" in link:
-                try:
-                    seg = link.split(";")[0].strip().strip("<>")
-                    parsed = urlparse(seg)
-                    q = parse_qs(parsed.query)
-                    page_info = q.get("page_info", [None])[0]
-                    if not page_info:
-                        break
-                    next_url = f"https://{shop}{parsed.path}"
-                    next_params = {
-                        "limit": str(limit),
-                        "status": status,
-                        "created_at_min": _iso(start_dt),
-                        "created_at_max": _iso(end_dt),
-                        "fields": "id,created_at,total_price,currency,order_number,line_items",
-                        "page_info": page_info,
-                    }
-                except Exception:
-                    break
-            else:
+        # Parse Link for next
+        link = r.headers.get("Link", "")
+        # Loop next pages: when page_info is present, REMOVE filters and send ONLY {page_info, limit}
+        for _ in range(50):
+            if 'rel="next"' not in link or "page_info=" not in link:
                 break
+            try:
+                seg = link.split(";")[0].strip().strip("<>")
+                parsed = urlparse(seg)
+                q = parse_qs(parsed.query)
+                page_info = q.get("page_info", [None])[0]
+                if not page_info:
+                    break
+                next_url = f"https://{shop}{parsed.path}"
+                next_params = {
+                    "limit": str(limit),
+                    "page_info": page_info,
+                }
+                r = client.get(next_url, headers=_shopify_headers(token), params=next_params)
+                r.raise_for_status()
+                payload = r.json()
+                all_orders.extend(payload.get("orders", []))
+                link = r.headers.get("Link", "")
+            except httpx.HTTPStatusError as e:
+                return JSONResponse({"error":"shopify_orders_error","status":e.response.status_code,"body":e.response.text}, status_code=502)
     except httpx.HTTPStatusError as e:
         return JSONResponse({"error":"shopify_orders_error","status":e.response.status_code,"body":e.response.text}, status_code=502)
     except httpx.HTTPError as e:
@@ -324,6 +325,7 @@ def api_sales(
     finally:
         client.close()
 
+    # Aggregate sales by day (UTC)
     by_day: Dict[str, Dict[str, Any]] = {}
     for o in all_orders:
         dt = _parse_dt(o["created_at"])
@@ -335,4 +337,14 @@ def api_sales(
         by_day[k]["sales"] += total
 
     rows = [by_day[k] for k in sorted(by_day.keys())]
-    return {"shop": shop, "start": _iso(start_dt), "end": _iso(end_dt), "count_orders": len(all_orders), "rows": rows}
+    return {
+        "shop": shop,
+        "start": _iso(start_dt),
+        "end": _iso(end_dt),
+        "count_orders": len(all_orders),
+        "rows": rows
+    }
+# -----------------------------
+# END
+# -----------------------------
+EOF
