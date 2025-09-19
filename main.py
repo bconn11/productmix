@@ -490,3 +490,32 @@ async def gdpr_shop_redact(request: Request):
     except Exception:
         pass
     return JSONResponse({"status": "ok"})
+# ==============================
+# SAFE DIAGNOSTICS (append-only)
+# ==============================
+# This block is safe even if your app already exists. If `app` isn't defined yet,
+# it creates one so these routes are available.
+try:
+    app
+except NameError:
+    from fastapi import FastAPI
+    app = FastAPI()
+
+from fastapi.responses import PlainTextResponse, JSONResponse
+
+@app.get("/", response_class=PlainTextResponse)
+def _root():
+    return "OK"
+
+@app.get("/health", response_class=JSONResponse)
+def _health():
+    return {"ok": True}
+
+@app.get("/diag", response_class=JSONResponse)
+def _diag():
+    import os
+    return {
+        "APP_URL": os.getenv("APP_URL"),
+        "DB_PATH": os.getenv("DB_PATH", "/tmp/data.sqlite"),
+        "API_VER": "2025-01"
+    }
