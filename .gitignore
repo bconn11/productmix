@@ -1,0 +1,3 @@
+main.backup.*.py
+*.sqlite
+__pycache__/
