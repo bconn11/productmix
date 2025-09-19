@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Render provides $PORT; default to 8080 for local builds
+# Render provides $PORT; default to 8080 for local dev
 ENV PORT=8080
 EXPOSE 8080
 
