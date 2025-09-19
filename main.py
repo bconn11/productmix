@@ -10,6 +10,9 @@ import httpx
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse
 
+# =========================
+# Env & config
+# =========================
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     return v if (v is not None and v != "") else default
@@ -21,6 +24,9 @@ SCOPES = env("SCOPES", "read_orders,read_products,read_customers")
 DB_PATH = env("DB_PATH", "/tmp/data.sqlite")
 API_VER = "2025-01"
 
+# =========================
+# App & DB
+# =========================
 app = FastAPI(title="ProductMix")
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -61,6 +67,9 @@ def get_scopes(shop: str) -> Optional[str]:
     conn.close()
     return row[0] if row else None
 
+# =========================
+# Shopify OAuth helpers
+# =========================
 def build_auth_url(shop: str) -> str:
     params = {
         "client_id": SHOPIFY_API_KEY,
@@ -83,9 +92,25 @@ def verify_hmac(params: Dict[str, str]) -> bool:
     ).hexdigest()
     return hmac.compare_digest(digest, h)
 
+def shopify_headers(token: str) -> Dict[str, str]:
+    return {
+        "X-Shopify-Access-Token": token,
+        "Accept": "application/json",
+    }
+
+def orders_url(shop: str) -> str:
+    return f"https://{shop}/admin/api/{API_VER}/orders.json"
+
+# =========================
+# Basic pages / diagnostics
+# =========================
 @app.get("/", response_class=PlainTextResponse)
-def root():
+def root_get():
     return "OK"
+
+@app.head("/", response_class=PlainTextResponse)
+def root_head():
+    return PlainTextResponse(content="", status_code=200)
 
 @app.get("/health")
 def health():
@@ -124,6 +149,25 @@ def diag_auth(shop: str = Query(...)):
             }, status_code=500)
     return {"auth_url": build_auth_url(shop)}
 
+@app.get("/diag/ping")
+def diag_ping():
+    return {"pong": True}
+
+@app.get("/diag/shopify")
+def diag_shopify(shop: str = Query(...)):
+    """Tiny probe: fetch 1 order without filters to verify token/network."""
+    tok = get_token(shop)
+    if not tok:
+        return JSONResponse({"error": "no_token_for_shop"}, status_code=401)
+    try:
+        r = httpx.get(orders_url(shop), headers=shopify_headers(tok), params={"limit": 1}, timeout=20.0)
+        return {"status": r.status_code, "ok": r.is_success, "link": r.headers.get("Link", ""), "sample": r.json().get("orders", [])[:1]}
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": "shopify_probe_http", "detail": str(e)}, status_code=502)
+
+# =========================
+# OAuth endpoints
+# =========================
 @app.get("/auth")
 def auth(shop: str = Query(...)):
     if not SHOPIFY_API_KEY or not SHOPIFY_API_SECRET or not APP_URL:
@@ -160,6 +204,9 @@ def auth_callback(request: Request):
 
     return RedirectResponse(f"/dashboard?shop={shop}")
 
+# =========================
+# Simple dashboard (debug)
+# =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(shop: str = Query(...)):
     html = f"""
@@ -202,17 +249,20 @@ def dashboard(shop: str = Query(...)):
     """
     return html
 
-def _parse_dt(s: str) -> datetime:
+# =========================
+# Sales API (cursor pagination fix)
+# =========================
+def parse_dt(s: str) -> datetime:
     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     return dt.astimezone(timezone.utc)
 
-def _iso(dt: datetime) -> str:
+def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def _day_key(dt: datetime) -> str:
+def day_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
-def _daterange_from_params(
+def daterange_from_params(
     start: Optional[str],
     end: Optional[str],
     days: Optional[int]
@@ -228,15 +278,6 @@ def _daterange_from_params(
     end_ceil = datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59, tzinfo=timezone.utc)
     return start_floor, end_ceil
 
-def _shopify_headers(token: str) -> Dict[str, str]:
-    return {
-        "X-Shopify-Access-Token": token,
-        "Accept": "application/json",
-    }
-
-def _orders_url(shop: str) -> str:
-    return f"https://{shop}/admin/api/{API_VER}/orders.json"
-
 @app.get("/api/sales")
 def api_sales(
     shop: str = Query(...),
@@ -250,28 +291,30 @@ def api_sales(
     if not token:
         return JSONResponse({"error":"no_token_for_shop"}, status_code=401)
 
-    start_dt, end_dt = _daterange_from_params(start, end, days)
+    start_dt, end_dt = daterange_from_params(start, end, days)
 
     base_params = {
         "status": status,
         "limit": str(limit),
-        "created_at_min": _iso(start_dt),
-        "created_at_max": _iso(end_dt),
+        "created_at_min": iso(start_dt),
+        "created_at_max": iso(end_dt),
         "fields": "id,created_at,total_price,currency,order_number,line_items",
     }
 
     client = httpx.Client(timeout=30.0)
-    url = _orders_url(shop)
+    url = orders_url(shop)
     all_orders: List[Dict[str, Any]] = []
 
     try:
-        r = client.get(url, headers=_shopify_headers(token), params=base_params)
+        # First page WITH filters
+        r = client.get(url, headers=shopify_headers(token), params=base_params)
         r.raise_for_status()
         payload = r.json()
         all_orders.extend(payload.get("orders", []))
 
+        # Next pages: ONLY page_info + limit (drop filters)
         link = r.headers.get("Link", "")
-        for _ in range(50):
+        for _ in range(100):
             if 'rel="next"' not in link or "page_info=" not in link:
                 break
             try:
@@ -282,11 +325,8 @@ def api_sales(
                 if not page_info:
                     break
                 next_url = f"https://{shop}{parsed.path}"
-                next_params = {
-                    "limit": str(limit),
-                    "page_info": page_info,
-                }
-                r = client.get(next_url, headers=_shopify_headers(token), params=next_params)
+                next_params = {"limit": str(limit), "page_info": page_info}
+                r = client.get(next_url, headers=shopify_headers(token), params=next_params)
                 r.raise_for_status()
                 payload = r.json()
                 all_orders.extend(payload.get("orders", []))
@@ -302,19 +342,21 @@ def api_sales(
 
     by_day: Dict[str, Dict[str, Any]] = {}
     for o in all_orders:
-        dt = _parse_dt(o["created_at"])
-        k = _day_key(dt)
-        total = float(o.get("total_price", "0") or 0)
-        if k not in by_day:
-            by_day[k] = {"date": k, "orders": 0, "sales": 0.0}
-        by_day[k]["orders"] += 1
-        by_day[k]["sales"] += total
+        try:
+            dt = parse_dt(o["created_at"])
+            k = day_key(dt)
+            total = float(o.get("total_price", "0") or 0)
+        except Exception:
+            continue
+        row = by_day.setdefault(k, {"date": k, "orders": 0, "sales": 0.0})
+        row["orders"] += 1
+        row["sales"] += total
 
     rows = [by_day[k] for k in sorted(by_day.keys())]
     return {
         "shop": shop,
-        "start": _iso(start_dt),
-        "end": _iso(end_dt),
+        "start": iso(start_dt),
+        "end": iso(end_dt),
         "count_orders": len(all_orders),
         "rows": rows
     }
