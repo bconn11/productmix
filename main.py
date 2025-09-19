@@ -1,10 +1,8 @@
 import os
 import hmac
-import base64
 import hashlib
 import sqlite3
-from urllib.parse import urlencode, quote, urlparse, parse_qs
-
+from urllib.parse import urlencode, urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -82,12 +80,12 @@ def build_auth_url(shop: str) -> str:
     return f"https://{shop}/admin/oauth/authorize?{urlencode(params)}"
 
 def verify_hmac(params: Dict[str, str]) -> bool:
-    """Verify HMAC from Shopify callback."""
-    if "hmac" not in params:
+    # params must NOT include "signature"; Shopify signs the sorted query excluding 'hmac' and 'signature'
+    p = dict(params)
+    h = p.pop("hmac", None)
+    if not h:
         return False
-    h = params.pop("hmac")
-    # Shopify signs the sorted query string (excluding hmac/signature)
-    message = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    message = "&".join([f"{k}={v}" for k, v in sorted(p.items())])
     digest = hmac.new(
         SHOPIFY_API_SECRET.encode("utf-8"),
         message.encode("utf-8"),
@@ -113,6 +111,8 @@ def diag():
         "DB_PATH": DB_PATH,
         "API_VER": API_VER,
         "SHOPIFY_API_KEY_present": bool(SHOPIFY_API_KEY),
+        "SHOPIFY_API_SECRET_present": bool(SHOPIFY_API_SECRET),
+        "computed_redirect_uri": f"{APP_URL}/auth/callback",
     }
 
 @app.get("/diag/state")
@@ -126,6 +126,17 @@ def diag_state(shop: str = Query(...)):
         "scopes": scopes,
     }
 
+@app.get("/diag/auth")
+def diag_auth(shop: str = Query(...)):
+    if not SHOPIFY_API_KEY or not SHOPIFY_API_SECRET or not APP_URL:
+        return JSONResponse(
+            {"error": "missing_env", "need": {
+                "SHOPIFY_API_KEY": bool(SHOPIFY_API_KEY),
+                "SHOPIFY_API_SECRET": bool(SHOPIFY_API_SECRET),
+                "APP_URL": APP_URL}
+            }, status_code=500)
+    return {"auth_url": build_auth_url(shop)}
+
 # -----------------------------
 # OAuth endpoints
 # -----------------------------
@@ -137,16 +148,11 @@ def auth(shop: str = Query(...)):
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
-    # Extract params into a dict[str,str]
     q = dict(request.query_params)
     shop = q.get("shop")
     code = q.get("code")
-    # Make a copy for HMAC verification (don't mutate original dict)
-    verify_map = {k: v for k, v in q.items() if k != "signature"}
-    if not verify_hmac(verify_map):
+    if not verify_hmac(q):
         raise HTTPException(status_code=400, detail="hmac_verification_failed")
-
-    # Exchange code for token
     if not shop or not code:
         raise HTTPException(status_code=400, detail="missing shop/code")
 
@@ -168,7 +174,6 @@ def auth_callback(request: Request):
     except httpx.HTTPError as e:
         raise HTTPException(status_code=400, detail=f"token_exchange_failed: {e}")
 
-    # Send to a simple dashboard page
     return RedirectResponse(f"/dashboard?shop={shop}")
 
 # -----------------------------
@@ -186,6 +191,8 @@ def dashboard(shop: str = Query(...)):
         body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 24px; }}
         .row {{ margin-bottom: 12px; }}
         pre {{ background:#f7f7f7; padding:12px; border-radius:6px; overflow:auto; }}
+        button {{ padding:8px 12px; }}
+        input, select {{ padding:6px; }}
       </style>
     </head>
     <body>
@@ -202,7 +209,8 @@ def dashboard(shop: str = Query(...)):
       <script>
         async function go() {{
           const days = document.getElementById('days').value || 7;
-          const res = await fetch(`/api/sales?shop={shop}&days=${{days}}`);
+          const url = `/api/sales?shop={shop}&days=${{days}}`;
+          const res = await fetch(url);
           const txt = await res.text();
           document.getElementById('out').textContent = txt;
         }}
@@ -233,14 +241,12 @@ def _daterange_from_params(
     days: Optional[int]
 ) -> Tuple[datetime, datetime]:
     if start and end:
-        # Interpret as inclusive days in local → convert to UTC start/end
         start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
         end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
     else:
         d = int(days or 7)
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=d)
-    # Clamp to whole-day bounds in UTC
     start_floor = datetime(start_dt.year, start_dt.month, start_dt.day, tzinfo=timezone.utc)
     end_ceil = datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59, tzinfo=timezone.utc)
     return start_floor, end_ceil
@@ -281,22 +287,17 @@ def api_sales(
     all_orders: List[Dict[str, Any]] = []
 
     try:
-        # Cursor pagination using page_info via Link header
         next_url = url
         next_params = params.copy()
-        for _ in range(20):  # hard cap to avoid runaway loops
+        for _ in range(20):
             r = client.get(next_url, headers=_shopify_headers(token), params=next_params)
             r.raise_for_status()
             data = r.json().get("orders", [])
             all_orders.extend(data)
 
-            # Parse Link header
             link = r.headers.get("Link", "")
-            # Example: <https://shop/admin/api/2025-01/orders.json?page_info=xxx&limit=250>; rel="next"
             if 'rel="next"' in link and "page_info=" in link:
-                # Extract next page_info
                 try:
-                    # simple parse
                     seg = link.split(";")[0].strip().strip("<>")
                     parsed = urlparse(seg)
                     q = parse_qs(parsed.query)
@@ -323,7 +324,6 @@ def api_sales(
     finally:
         client.close()
 
-    # Aggregate sales by day (UTC)
     by_day: Dict[str, Dict[str, Any]] = {}
     for o in all_orders:
         dt = _parse_dt(o["created_at"])
@@ -334,10 +334,5 @@ def api_sales(
         by_day[k]["orders"] += 1
         by_day[k]["sales"] += total
 
-    # Return sorted days
     rows = [by_day[k] for k in sorted(by_day.keys())]
     return {"shop": shop, "start": _iso(start_dt), "end": _iso(end_dt), "count_orders": len(all_orders), "rows": rows}
-
-# -----------------------------
-# END OF FILE
-# -----------------------------
