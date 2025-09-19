@@ -34,7 +34,8 @@ SHOPIFY_API_KEY = env("SHOPIFY_API_KEY", "")
 SHOPIFY_API_SECRET = env("SHOPIFY_API_SECRET", "")
 SCOPES = env("SCOPES", "read_orders,read_products,read_customers")
 API_VER = "2025-01"
-DB_PATH = env("DB_PATH", "data.sqlite")
+DB_PATH = env("DB_PATH", "/tmp/data.sqlite")
+
 
 # -----------------------------------------------------------------------------
 # App
